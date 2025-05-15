@@ -27,106 +27,145 @@ app.config['RESULT_FOLDER'] = RESULT_FOLDER
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 
+def download_file(url, path):
+    """Download file with progress and error handling"""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 8192
+        with open(path, 'wb') as f:
+            for data in response.iter_content(block_size):
+                f.write(data)
+        return True
+    except Exception as e:
+        print(f"Error downloading {url}: {str(e)}")
+        return False
+
 def load_model():
-    """Load model files from Google Drive using temporary files"""
-    print("Loading model files...")
+    """Load model with proper error handling"""
+    print("Initializing colorization model...")
     
     # Create temporary directory
     with tempfile.TemporaryDirectory() as temp_dir:
-        # Download prototxt
-        prototxt_path = os.path.join(temp_dir, "colorization_deploy_v2.prototxt")
-        with requests.get(MODEL_URLS["prototxt"], stream=True) as r:
-            r.raise_for_status()
-            with open(prototxt_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-        
-        # Download caffemodel
-        caffemodel_path = os.path.join(temp_dir, "colorization_release_v2.caffemodel")
-        with requests.get(MODEL_URLS["caffemodel"], stream=True) as r:
-            r.raise_for_status()
-            with open(caffemodel_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-        
-        # Download numpy array
+        prototxt_path = os.path.join(temp_dir, "deploy.prototxt")
+        caffemodel_path = os.path.join(temp_dir, "model.caffemodel")
         npy_path = os.path.join(temp_dir, "pts_in_hull.npy")
-        with requests.get(MODEL_URLS["npy"], stream=True) as r:
-            r.raise_for_status()
-            with open(npy_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
         
-        # Load the cluster centers
-        pts_in_hull = np.load(npy_path)
+        # Download all required files
+        if not all([
+            download_file(MODEL_URLS["prototxt"], prototxt_path),
+            download_file(MODEL_URLS["caffemodel"], caffemodel_path),
+            download_file(MODEL_URLS["npy"], npy_path)
+        ]):
+            raise RuntimeError("Failed to download model files")
+        
+        # Verify files were downloaded
+        if not all(os.path.exists(p) for p in [prototxt_path, caffemodel_path, npy_path]):
+            raise FileNotFoundError("Some model files are missing")
+        
+        # Load cluster centers
+        try:
+            pts_in_hull = np.load(npy_path)
+            print("Successfully loaded cluster centers")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load cluster centers: {str(e)}")
         
         # Load the model
-        net = cv2.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
+        try:
+            net = cv2.dnn.readNetFromCaffe(prototxt_path, caffemodel_path)
+            if net.empty():
+                raise RuntimeError("Failed to load model: network is empty")
+            print("Successfully loaded Caffe model")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Caffe model: {str(e)}")
         
-        # Add the cluster centers
-        class8 = net.getLayerId("class8_ab")
-        conv8 = net.getLayerId("conv8_313_rh")
-        pts = pts_in_hull.transpose().reshape(2, 313, 1, 1)
-        net.getLayer(class8).blobs = [pts.astype("float32")]
-        net.getLayer(conv8).blobs = [np.full([1, 313], 2.606, dtype="float32")]
+        # Add cluster centers to the model
+        try:
+            class8 = net.getLayerId("class8_ab")
+            conv8 = net.getLayerId("conv8_313_rh")
+            pts = pts_in_hull.transpose().reshape(2, 313, 1, 1)
+            net.getLayer(class8).blobs = [pts.astype("float32")]
+            net.getLayer(conv8).blobs = [np.full([1, 313], 2.606, dtype="float32")]
+            print("Successfully configured model layers")
+        except Exception as e:
+            raise RuntimeError(f"Failed to configure model layers: {str(e)}")
     
-    print("Model loaded successfully")
     return net
 
-# Initialize the model when the app starts
-net = load_model()
+# Initialize model at startup
+try:
+    net = load_model()
+    print("Model initialized successfully!")
+except Exception as e:
+    print(f"Fatal error during model initialization: {str(e)}")
+    exit(1)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def colorize_image(image_path, output_path):
-    """Colorize the input image"""
-    img = cv2.imread(image_path)
-    scaled = img.astype("float32") / 255.0
-    lab_img = cv2.cvtColor(scaled, cv2.COLOR_BGR2LAB)
-    
-    resized = cv2.resize(lab_img, (224, 224))
-    L = cv2.split(resized)[0]
-    L -= 50
-    
-    net.setInput(cv2.dnn.blobFromImage(L))
-    ab_channel = net.forward()[0, :, :, :].transpose((1, 2, 0))
-    ab_channel = cv2.resize(ab_channel, (img.shape[1], img.shape[0]))
-    
-    L = cv2.split(lab_img)[0]
-    colorized = np.concatenate((L[:, :, np.newaxis], ab_channel), axis=2)
-    colorized = cv2.cvtColor(colorized, cv2.COLOR_LAB2BGR)
-    colorized = np.clip(colorized, 0, 1)
-    colorized = (255 * colorized).astype("uint8")
-    
-    img = cv2.resize(img, (640, 640))
-    colorized = cv2.resize(colorized, (640, 640))
-    result = cv2.hconcat([img, colorized])
-    cv2.imwrite(output_path, result)
+    """Colorize image with error handling"""
+    try:
+        # Read and preprocess image
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError("Failed to read input image")
+        
+        scaled = img.astype("float32") / 255.0
+        lab_img = cv2.cvtColor(scaled, cv2.COLOR_BGR2LAB)
+        
+        # Prepare L channel
+        resized = cv2.resize(lab_img, (224, 224))
+        L = cv2.split(resized)[0]
+        L -= 50
+        
+        # Colorization
+        net.setInput(cv2.dnn.blobFromImage(L))
+        ab_channel = net.forward()[0, :, :, :].transpose((1, 2, 0))
+        ab_channel = cv2.resize(ab_channel, (img.shape[1], img.shape[0]))
+        
+        # Combine channels
+        L = cv2.split(lab_img)[0]
+        colorized = np.concatenate((L[:, :, np.newaxis], ab_channel), axis=2)
+        colorized = cv2.cvtColor(colorized, cv2.COLOR_LAB2BGR)
+        colorized = np.clip(colorized, 0, 1)
+        colorized = (255 * colorized).astype("uint8")
+        
+        # Create comparison image
+        img = cv2.resize(img, (640, 640))
+        colorized = cv2.resize(colorized, (640, 640))
+        result = cv2.hconcat([img, colorized])
+        cv2.imwrite(output_path, result)
+        return True
+    except Exception as e:
+        print(f"Error during colorization: {str(e)}")
+        return False
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
     if request.method == 'POST':
         if 'file' not in request.files:
             return render_template('index.html', error='No file part')
-            
+        
         file = request.files['file']
         
         if file.filename == '':
             return render_template('index.html', error='No selected file')
-            
+        
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
             input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(input_path)
+            output_path = os.path.join(app.config['RESULT_FOLDER'], f'colorized_{filename}')
             
-            output_filename = 'colorized_' + filename
-            output_path = os.path.join(app.config['RESULT_FOLDER'], output_filename)
-            
-            colorize_image(input_path, output_path)
-            
-            return render_template('result.html', image=output_filename)
+            try:
+                file.save(input_path)
+                if colorize_image(input_path, output_path):
+                    return render_template('result.html', image=f'colorized_{filename}')
+                else:
+                    return render_template('index.html', error='Colorization failed')
+            except Exception as e:
+                return render_template('index.html', error=f'Processing error: {str(e)}')
     
     return render_template('index.html')
 
